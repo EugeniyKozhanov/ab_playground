@@ -1,0 +1,144 @@
+#!/bin/sh
+# Custom init script (PID 1)
+
+echo "[custom-init] Boot starting..."
+
+mount -t proc proc /proc
+mount -t tmpfs tmpfs /tmp
+
+CMDLINE=$(cat /proc/cmdline)
+echo "[custom-init] cmdline: $CMDLINE"
+
+# Do your bootparam logic
+if echo "$CMDLINE" | grep -q "debug_mode=1"; then
+    echo "[custom-init] Debug mode: starting shell"
+    exec /bin/sh
+fi
+
+if [ -b /dev/vdb ]; then
+    echo "[custom-init] SD card detected"
+    # In this case, we can:
+    # 1. Boot from SD card (if it has a valid OS)
+    # 2. Boot to core OS and make update by RC scipt
+    mount -t ext4 /dev/vdb /mnt/sdcard
+    if [ -f /mnt/sdcard/update.raucb ]; then
+	mount -t tmpfs none /data
+        echo "[custom-init] Found update.raucb on SD card, applying update..."
+        exec /sbin/init
+    fi
+fi
+
+export LD_LIBRARY_PATH=/ostree-repo/os-chroot/lib:/ostree-repo/os-chroot/lib64:/lib:/lib64
+mount -t ext4 /dev/vda4 /mnt/ostree
+mount -t ext2 /dev/vda1 /mnt/uboot
+
+cd /mnt/ostree/ostree-repo/
+
+# update profile list fot uboot
+OS_PROFILES=$(ostree --repo=repo refs | grep -v '\^' | tr '\n' ' ')
+fw_setenv -l /tmp OS_PROFILES "$OS_PROFILES"
+
+LAST_PROFILE=$(fw_printenv -l /tmp/ | grep last_profile= | cut -d= -f2)
+NEED_PROFILE=$(fw_printenv -l /tmp/ | grep need_profile= | cut -d= -f2)
+PROFILE=""
+
+if [ -n "$NEED_PROFILE" ]; then
+    PROFILE="$NEED_PROFILE"
+    # reset need_profile
+    fw_setenv -l /tmp need_profile
+elif [ -n "$LAST_PROFILE" ]; then
+    PROFILE="$LAST_PROFILE"
+fi
+
+
+# If no profile or invalid profile, ask user to select one
+while [ -z "$PROFILE" ]; do
+    echo "No profile selected."
+    echo "Available profiles:"
+    ostree --repo=repo refs | grep -v '\^' | nl
+    echo "Select profile by number (default 1):"
+    read -r PROFILE_NUM
+    if [ -z "$PROFILE_NUM" ]; then
+        PROFILE_NUM=1
+    fi
+    PROFILE=$(ostree --repo=repo refs | grep -v '\^' | sed -n "${PROFILE_NUM}p")
+done
+
+fw_setenv -l /tmp last_profile "$PROFILE"
+echo "[custom-init] Using profile: $PROFILE"
+
+# check if profile directory exists
+# if not, create it by checking out the ostree
+if [ ! -d "/mnt/ostree/ostree-repo/$PROFILE" ]; then
+    ostree --repo=repo checkout  "$PROFILE" "./$PROFILE"
+else
+    echo "[custom-init] Profile directory exists."
+    echo "Options:"
+    echo "1. Just boot (don't commit changes)" 
+    echo "2. Commit changes"
+    echo "3. Discard changes (checkout commit)"
+    read -r OPTION
+    case $OPTION in
+        1)
+            echo "Using existing profile as is."
+            ;;
+        2)
+            echo "Enter commit message:"
+            read -r COMMIT_MSG
+            ostree --repo=repo commit --branch "$PROFILE" -s "$COMMIT_MSG" "./$PROFILE"
+            ;;
+        3)
+            # read commit hash form log
+            COMMIT=""
+            while [ -z "$COMMIT" ]; do
+                echo "Available commits:"
+                ostree --repo=repo log "$PROFILE" | grep '^commit' | nl
+                echo "Select commit by number (default 1):"
+                read -r COMMIT_NUM
+                if [ -z "$COMMIT_NUM" ]; then
+                    COMMIT_NUM=1
+                fi
+                COMMIT=$(ostree --repo=repo log "$PROFILE" | grep '^commit' | sed -n "${COMMIT_NUM}p" | awk '{print $2}')
+            done
+            echo "Checking out commit: $COMMIT"
+            rm -rf "./$PROFILE"
+            ostree --repo=repo checkout "$COMMIT" "./$PROFILE"
+            ;;
+        *)
+            echo "Invalid option. Using existing profile as is."
+            ;;
+    esac
+
+fi
+
+ostree --repo=repo checkout  "$PROFILE" "./$PROFILE"
+
+PIVOT_ROOT_OS="/mnt/ostree/ostree-repo/$PROFILE"
+PIVOT_ROOT_BIND="/mnt/ostree/"
+cd /
+mount --bind "$PIVOT_ROOT_OS" "$PIVOT_ROOT_BIND"
+cd "$PIVOT_ROOT_BIND"
+mkdir .old_root
+pivot_root . .old_root
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t tmpfs tmpfs /run
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /tmp
+umount .old_root/mnt/uboot
+umount .old_root/mnt/ostree
+umount .old_root/proc
+umount .old_root/sys
+umount .old_root/dev/pts
+umount .old_root/dev
+umount .old_root/run
+umount .old_root/tmp
+
+exec chroot . /bin/bash -c 'umount .old_root && rm -rf .old_root && exec /sbin/init' 
+
+
+## Otherwise, continue normal boot
+#echo "[custom-init] Handing over to BusyBox init..."
+#exec /sbin/init
+
